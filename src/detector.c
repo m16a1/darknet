@@ -1,3 +1,9 @@
+#include <sys/stat.h>
+#include <slcurses.h>
+#include <dirent.h>
+#include <ctype.h>
+#include <tkPort.h>
+#include <libgen.h>
 #include "network.h"
 #include "region_layer.h"
 #include "cost_layer.h"
@@ -366,7 +372,7 @@ void validate_detector(char *datacfg, char *cfgfile, char *weightfile)
         if(fps) fclose(fps[j]);
     }
     if(coco){
-        fseek(fp, -2, SEEK_CUR); 
+        fseek(fp, -2, SEEK_CUR);
         fprintf(fp, "\n]\n");
         fclose(fp);
     }
@@ -513,6 +519,80 @@ void test_detector(char *datacfg, char *cfgfile, char *weightfile, char *filenam
     }
 }
 
+void annotate_one_file(char *filename, network net, float thresh)
+{
+    char *b_name = basename(filename);
+    char *extension = strrchr(b_name, '.');
+    if (extension == NULL || (strcmp(extension, ".png") != 0 && strcmp(extension, ".jpg") != 0)) {
+        return;
+    }
+
+    char file_wo_ext[255] = "";
+    char txt_file[255] = "";
+    strncpy(file_wo_ext, filename, strlen(filename) - 4);
+    sprintf(txt_file, "%s%s", file_wo_ext, ".txt");
+
+    image im = load_image_color(filename, 0, 0);
+    image sized = resize_image(im, net.w, net.h);
+    layer l = net.layers[net.n - 1];
+    box *boxes = calloc(l.w * l.h * l.n, sizeof(box));
+    float **probs = calloc(l.w * l.h * l.n, sizeof(float *));
+    for (int j = 0; j < l.w * l.h * l.n; ++j) probs[j] = calloc(l.classes, sizeof(float *));
+    float *X = sized.data;
+    clock_t time = clock();
+    network_predict(net, X);
+    printf("%s: Annotated in %.1f ms.\n", filename, sec(clock() - time) * 1000);
+    get_region_boxes(l, 1, 1, thresh, probs, boxes, 0, 0);
+    do_nms_sort(boxes, probs, l.w * l.h * l.n, l.classes, 0.4);
+    int num = l.w * l.h * l.n;
+
+    for(int i = 0; i < num; ++i) {
+        int class = max_index(probs[i], l.classes);
+        float prob = probs[i][class];
+        if (prob < thresh) continue;
+
+        box b = boxes[i];
+        FILE *f = fopen(txt_file, "a");
+        fprintf(f, "%i %f %f %f %f\n", class, b.x, b.y, b.w, b.h);
+        fclose(f);
+    }
+
+    free_image(im);
+    free_image(sized);
+    free(boxes);
+    free_ptrs((void **) probs, l.w * l.h * l.n);
+}
+
+void annotate_detector(char *cfg, char *weights, char *filename, float thresh)
+{
+    char *full_name = realpath(filename, NULL);
+    struct stat stat_buf;
+
+    if (stat(full_name, &stat_buf) != 0) {
+        printf("File or directory %s not found", full_name);
+        exit(1);
+    }
+
+    network net = parse_network_cfg(cfg);
+    load_weights(&net, weights);
+    set_batch_network(&net, 1);
+    srand(2222222);
+
+    if (S_ISDIR(stat_buf.st_mode)) {
+        DIR *d;
+        struct dirent *file;
+        d = opendir(full_name);
+
+        while ((file = readdir(d)) != NULL) {
+            char full_image_name[255];
+            sprintf(full_image_name, "%s/%s", full_name, file->d_name);
+            annotate_one_file(full_image_name, net, thresh);
+        }
+    } else if (S_ISREG(stat_buf.st_mode)) {
+        annotate_one_file(full_name, net, thresh);
+    }
+}
+
 void run_detector(int argc, char **argv)
 {
 	char *out_filename = find_char_arg(argc, argv, "-out_filename", 0);
@@ -559,6 +639,7 @@ void run_detector(int argc, char **argv)
     else if(0==strcmp(argv[2], "train")) train_detector(datacfg, cfg, weights, gpus, ngpus, clear);
     else if(0==strcmp(argv[2], "valid")) validate_detector(datacfg, cfg, weights);
     else if(0==strcmp(argv[2], "recall")) validate_detector_recall(datacfg, cfg, weights);
+    else if (0 == strcmp(argv[2], "annotate")) annotate_detector(cfg, weights, filename, thresh);
     else if(0==strcmp(argv[2], "demo")) {
         list *options = read_data_cfg(datacfg);
         int classes = option_find_int(options, "classes", 20);
